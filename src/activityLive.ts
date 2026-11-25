@@ -202,7 +202,22 @@ export class ActivityIndexerLive {
   async indexActivity(
     connection: Connection,
     poolAddress: PublicKey,
-    opts?: { scanLimit?: number; forceRefresh?: boolean },
+    opts?: {
+      scanLimit?: number;
+      forceRefresh?: boolean;
+      /** OPTIONAL authoritative vault passthrough (Option 2 Phase 1,
+       *  item A): when the caller already holds the pool's parsed
+       *  AmmInfo identity (discovery records carry coinVault/pcVault),
+       *  passing them here eliminates the redundant on-chain pool
+       *  fetch the derivation would otherwise perform. The SDK treats
+       *  caller-provided vaults as authoritative exactly as it would
+       *  its own fetch — identity and ownership validation semantics
+       *  are unchanged (the SDK still fails closed to
+       *  `pool_vaults_unavailable` for swap-tagged candidates when
+       *  vaults are unavailable). */
+      coinVault?: PublicKey;
+      pcVault?: PublicKey;
+    },
   ): Promise<ActivityEvidence> {
     const key = poolAddress.toBase58();
     const now = Date.now();
@@ -215,6 +230,8 @@ export class ActivityIndexerLive {
 
     const result = await deriveLastSwapEvidenceV4(connection, RAYDIUM_V4_PROGRAM_ID, poolAddress, {
       scanLimit,
+      ...(opts?.coinVault !== undefined ? { coinVault: opts.coinVault } : {}),
+      ...(opts?.pcVault !== undefined ? { pcVault: opts.pcVault } : {}),
     });
 
     const buildEvidence = (): ActivityEvidence => ({

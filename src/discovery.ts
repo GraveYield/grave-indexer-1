@@ -36,6 +36,13 @@ import {
   type EndpointKind,
   type Provenance,
 } from "./provenance.js";
+import {
+  RpcHttpError,
+  withRpcRetry,
+  parseRetryAfterMs,
+  type RateGovernor,
+  type RpcRetryPolicy,
+} from "./rpcGovernance.js";
 
 /**
  * AmmInfo identity window: the SDK pins coin_vault@336, pc_vault@368,
@@ -45,7 +52,7 @@ import {
  * are the SDK offsets minus 336.
  */
 const SLICE_OFFSET = 336;
-const SLICE_LENGTH = 160;
+export const SLICE_LENGTH = 160;
 const SLICE_OFF = { COIN_VAULT: 0, PC_VAULT: 32, COIN_VAULT_MINT: 64, PC_VAULT_MINT: 96, LP_MINT: 128 } as const;
 
 /** Parse the identity fields from a 160-byte AmmInfo data slice. */
@@ -120,6 +127,22 @@ export interface DiscoveryRunStats {
    *  cap must never silently truncate a candidate universe that is then
    *  presented as complete (GY-M1-INT-001 §7). */
   truncated: boolean;
+  /** Bounded-observation provenance (Option 2, slot-consistency
+   *  correction). OPTIONAL so existing consumers keep their shape.
+   *  The slot bracket recorded above is a BOUNDED OBSERVATION WINDOW —
+   *  even when lower and upper finalized slots are within 400 slots of
+   *  each other it is NOT an atomic snapshot: accounts may change
+   *  during the window. This field records the actual observation
+   *  facts: the provider identity, the commitment the RPC served, the
+   *  response `context.slot` when the provider supplied one, and the
+   *  explicit non-snapshot description. No point-in-time snapshot is
+   *  claimed anywhere downstream. */
+  observation?: {
+    commitment: string;
+    providerIdentity: string;
+    responseContextSlot: number | null;
+    boundedWindowDescription: string;
+  };
 }
 
 export interface DiscoveryRun {
@@ -146,6 +169,11 @@ export interface DiscoverOptions {
   rpcFilters?: unknown[];
   /** Injectable transport for tests (defaults to global fetch). */
   fetchImpl?: typeof fetch;
+  /** OPTIONAL bounded retry policy — passed through to the raw gPA
+   *  transport (Option 2 Phase 1). Omitted = previous behavior. */
+  retry?: RpcRetryPolicy;
+  /** OPTIONAL shared rate governor. */
+  governor?: RateGovernor;
 }
 
 interface RawProgramAccount {
@@ -162,10 +190,25 @@ interface RawProgramAccount {
  * result shapes observed in the wild: a bare array and the classic
  * `{ context, value }` wrapper.
  */
+export interface FetchProgramAccountsRawOptions {
+  filters: unknown[];
+  dataSlice?: { offset: number; length: number };
+  fetchImpl?: typeof fetch;
+  /** OPTIONAL bounded retry policy (Option 2 Phase 1). When omitted the
+   *  transport behaves EXACTLY as before (single attempt) so existing
+   *  callers and tests are unaffected. When provided, HTTP 429/5xx,
+   *  JSON-RPC -32005 and transport failures retry with jittered
+   *  exponential backoff honoring Retry-After; exhaustion surfaces as
+   *  a typed `RpcRetriesExhaustedError` — never as a partial result. */
+  retry?: RpcRetryPolicy;
+  /** OPTIONAL shared rate governor (Option 2 Phase 1). */
+  governor?: RateGovernor;
+}
+
 export async function fetchProgramAccountsRaw(
   rpcEndpoint: string,
   programId: PublicKey,
-  opts: { filters: unknown[]; dataSlice?: { offset: number; length: number }; fetchImpl?: typeof fetch },
+  opts: FetchProgramAccountsRawOptions,
 ): Promise<RawProgramAccount[]> {
   const doFetch = opts.fetchImpl ?? fetch;
   const body = {
@@ -181,26 +224,68 @@ export async function fetchProgramAccountsRaw(
       },
     ],
   };
-  const res = await doFetch(rpcEndpoint, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    throw new Error(`getProgramAccounts HTTP ${res.status} from ${endpointKindFor(rpcEndpoint)} endpoint`);
-  }
-  const json = (await res.json()) as {
-    error?: unknown;
-    result?: RawProgramAccount[] | { value?: RawProgramAccount[] };
+  const sendOnce = async (): Promise<{
+    accounts: RawProgramAccount[];
+    contextSlot: number | null;
+  }> => {
+    const acquire = opts.governor ? await opts.governor.acquire() : null;
+    let res: Response;
+    try {
+      res = await doFetch(rpcEndpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    } finally {
+      acquire?.();
+    }
+    if (!res.ok) {
+      throw new RpcHttpError(
+        res.status,
+        `getProgramAccounts HTTP ${res.status} from ${endpointKindFor(rpcEndpoint)} endpoint`,
+        parseRetryAfterMs(res.headers.get("retry-after")),
+      );
+    }
+    const json = (await res.json()) as {
+      error?: unknown;
+      result?:
+        | RawProgramAccount[]
+        | { value?: RawProgramAccount[]; context?: { slot?: unknown } };
+    };
+    if (json.error !== undefined && json.error !== null) {
+      throw new Error(`getProgramAccounts RPC error: ${JSON.stringify(json.error).slice(0, 200)}`);
+    }
+    const wrapped = !Array.isArray(json.result)
+      ? (json.result as { value?: RawProgramAccount[]; context?: { slot?: unknown } } | undefined)
+      : undefined;
+    const value = Array.isArray(json.result) ? json.result : wrapped?.value;
+    if (!Array.isArray(value)) {
+      throw new Error("unexpected getProgramAccounts response shape (no account array)");
+    }
+    const contextSlotRaw = wrapped?.context?.slot;
+    const contextSlot =
+      typeof contextSlotRaw === "number" && Number.isSafeInteger(contextSlotRaw) ? contextSlotRaw : null;
+    return { accounts: value, contextSlot };
   };
-  if (json.error !== undefined && json.error !== null) {
-    throw new Error(`getProgramAccounts RPC error: ${JSON.stringify(json.error).slice(0, 200)}`);
-  }
-  const value = Array.isArray(json.result) ? json.result : json.result?.value;
-  if (!Array.isArray(value)) {
-    throw new Error("unexpected getProgramAccounts response shape (no account array)");
-  }
-  return value;
+  // Without a retry policy the transport is single-attempt (previous
+  // behavior preserved exactly); with one, failures are retried within
+  // the bounded budget and exhaustion stays an explicit typed failure.
+  const { accounts, contextSlot } = opts.retry
+    ? await withRpcRetry(sendOnce, opts.retry, { label: "getProgramAccounts" })
+    : await sendOnce();
+  // The context slot is stashed for the run's bounded-observation
+  // provenance (module-level stash is safe: discovery is the only
+  // consumer and runs are sequential per process).
+  lastResponseContextSlot = contextSlot;
+  return accounts;
+}
+
+/** Most recent gPA response context slot (observability seam). */
+let lastResponseContextSlot: number | null = null;
+
+/** The context slot of the last `fetchProgramAccountsRaw` response. */
+export function lastProgramAccountsContextSlot(): number | null {
+  return lastResponseContextSlot;
 }
 
 /**
@@ -218,6 +303,7 @@ export async function discoverRaydiumV4Pools(
   const mode = opts.mode ?? "identity-slice";
 
   const slotLowerBound = Number(await connection.getSlot());
+  const commitment = "confirmed (Connection commitment used for the slot brackets)";
 
   // The mandatory dataSize filter pins the canonical 752-byte AmmInfo
   // corpus; optional caller filters (e.g. the M1 WSOL quote-side memcmp)
@@ -231,7 +317,10 @@ export async function discoverRaydiumV4Pools(
     filters,
     ...(mode === "identity-slice" ? { dataSlice: { offset: SLICE_OFFSET, length: SLICE_LENGTH } } : {}),
     ...(opts.fetchImpl !== undefined ? { fetchImpl: opts.fetchImpl } : {}),
+    ...(opts.retry !== undefined ? { retry: opts.retry } : {}),
+    ...(opts.governor !== undefined ? { governor: opts.governor } : {}),
   });
+  const responseContextSlot = lastProgramAccountsContextSlot();
 
   const slotUpperBound = Number(await connection.getSlot());
 
@@ -330,6 +419,22 @@ export async function discoverRaydiumV4Pools(
   // incomplete run can be distinguished from a complete one downstream.
   stats.truncated = iteratedAccounts < rawAccounts.length;
   stats.durationMs = Date.now() - startedAt;
+  // Bounded-observation provenance (Option 2 slot-consistency
+  // correction): the [slotLowerBound..slotUpperBound] bracket is an
+  // observation window, NOT a snapshot. Record the actual observation
+  // facts so operators and downstream consumers never mistake the
+  // bracket for atomicity.
+  stats.observation = {
+    commitment,
+    providerIdentity: `classic getProgramAccounts @ ${endpointKind} endpoint`,
+    responseContextSlot: responseContextSlot,
+    boundedWindowDescription:
+      `bounded observation window: slot ${slotLowerBound} observed immediately BEFORE the enumeration ` +
+      `and slot ${slotUpperBound} immediately AFTER; response context slot: ${responseContextSlot === null ? "not provided" : String(responseContextSlot)}. ` +
+      "A lower/upper finalized slot bracket — even within 400 slots — is NOT an atomic snapshot: " +
+      "accounts may change during the window. This run claims a bounded observation window, " +
+      "never a point-in-time snapshot.",
+  };
 
   // Deterministic order — ascending base58 pool address.
   const ordered = [...records.values()].sort((a, b) =>

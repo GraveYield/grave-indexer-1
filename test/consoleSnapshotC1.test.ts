@@ -281,8 +281,23 @@ class VerificationRpc {
 
 /** getProgramAccounts transport fake (same shape as ingest.test.ts): the
  *  discovery enumeration sees one WSOL-supported pool per requested
- *  address, carrying the synthetic 160-byte identity slice. */
+ *  address. The identity slice carries the REAL fixture pool's vault
+ *  addresses (from pool_account_sol_usdc.json) with the synthetic WSOL
+ *  quote-side mint: vault passthrough (Option 2 Phase 1-A) feeds the
+ *  discovery record's vaults into the SDK derivation as authoritative,
+ *  so they must MATCH the vault corroboration the real swap fixture
+ *  performs — exactly as they do in production, where discovery and
+ *  derivation read the same on-chain account. */
+function realFixtureVaults(): { coinVault: PublicKey; pcVault: PublicKey } {
+  const pool = poolAccountBytes();
+  return {
+    coinVault: new PublicKey(pool.slice(336, 368)), // coin_vault @336
+    pcVault: new PublicKey(pool.slice(368, 400)), // pc_vault @368
+  };
+}
+
 function gpaFetch(pools: PublicKey[]): typeof fetch {
+  const { coinVault, pcVault } = realFixtureVaults();
   return (async () =>
     new Response(
       JSON.stringify({
@@ -291,7 +306,7 @@ function gpaFetch(pools: PublicKey[]): typeof fetch {
         result: pools.map((p) => ({
           pubkey: p.toBase58(),
           account: {
-            data: [Buffer.from(buildAmmInfoSlice()).toString("base64"), "base64"],
+            data: [Buffer.from(buildAmmInfoSlice({ coinVault, pcVault })).toString("base64"), "base64"],
             owner: RAYDIUM_V4_PROGRAM_ID.toBase58(),
           },
         })),

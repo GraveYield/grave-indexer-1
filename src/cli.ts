@@ -14,11 +14,24 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { join } from "node:path";
 import { Connection, PublicKey } from "@solana/web3.js";
-import { fetchV4Pool, decodeScannerProtocolConfig } from "@graveyield/sdk";
+import { fetchV4Pool, decodeScannerProtocolConfig, RAYDIUM_V4_PROGRAM_ID, RAYDIUM_V4_AMM_INFO_SIZE } from "@graveyield/sdk";
 
-import { loadPipelineConfig, type PipelineConfig } from "./config.js";
-import { discoverRaydiumV4Pools } from "./discovery.js";
+import { loadPipelineConfig, loadRpcGovernanceConfig, retryPolicyFromConfig, type PipelineConfig, type RpcGovernanceConfig } from "./config.js";
+import { discoverRaydiumV4Pools, DISCOVERY_SLICE } from "./discovery.js";
 import type { DiscoveredPoolRecord } from "./discovery.js";
+import {
+  discoverRaydiumV4PoolsPaginated,
+  makeHeliusGpaV2Provider,
+  probeGetProgramAccountsV2,
+} from "./discoveryPaginated.js";
+import {
+  getSharedGovernor,
+  mapWithConcurrency,
+  withRpcRetry,
+  type RateGovernor,
+  type RpcRetryPolicy,
+} from "./rpcGovernance.js";
+import { rpcBatch, type BatchRequest } from "./rpcBatch.js";
 import { IngestLedger } from "./ingest.js";
 import { HealthRegistry } from "./health.js";
 import {
@@ -458,6 +471,91 @@ function indexerGitHead(): string | null {
   }
 }
 
+// ─── Option 2 Phase 1: enrichment fact transport ─────────────────────────────
+
+/** The four token facts per pool: two vault balances + two mint supplies. */
+interface PoolTokenFactTargets {
+  wsolVault: PublicKey;
+  memecoinVault: PublicKey;
+  memecoinMint: PublicKey;
+  lpMint: PublicKey;
+}
+
+function parseTokenAmount(result: unknown, what: string): { amount: string; decimals: number } {
+  const value = (result as { value?: { amount?: unknown; decimals?: unknown } } | null)?.value;
+  if (typeof value?.amount !== "string" || typeof value?.decimals !== "number") {
+    throw new Error(`pool facts malformed: ${what} returned an unexpected response shape`);
+  }
+  return { amount: value.amount, decimals: value.decimals };
+}
+
+/**
+ * Fetch the four token facts for one pool.
+ *
+ * Default path (batch disabled): the previous per-call web3.js
+ * Connection path — now wrapped in the BOUNDED retry policy (a
+ * successful call behaves identically; a failing one retries within
+ * the bounded budget and exhaustion surfaces as a typed, explicit
+ * failure — never as a negative fact).
+ *
+ * Opt-in path (RPC_BATCH_ENABLED=true): ONE validated JSON-RPC batch
+ * per pool. Every per-item error, missing item, duplicate id, stray id
+ * or malformed response is an explicit per-pool failure — an unresolved
+ * fact is never interpreted as a negative result (Part 2 §1-D).
+ */
+async function fetchPoolTokenFacts(
+  retry: RpcRetryPolicy,
+  governor: RateGovernor,
+  conn: Connection,
+  batch: { enabled: boolean; rpcUrl: string; fetchImpl?: typeof fetch | undefined },
+  targets: PoolTokenFactTargets,
+): Promise<{ wsolAmount: string; memecoinAmount: string; memecoinDecimals: number; lpSupplyAmount: string }> {
+  if (!batch.enabled) {
+    const [wsolBal, memecoinBal, memecoinSupply, lpSupply] = await Promise.all([
+      withRpcRetry(() => conn.getTokenAccountBalance(targets.wsolVault), retry, { label: "getTokenAccountBalance(ws)" }),
+      withRpcRetry(() => conn.getTokenAccountBalance(targets.memecoinVault), retry, { label: "getTokenAccountBalance(mem)" }),
+      withRpcRetry(() => conn.getTokenSupply(targets.memecoinMint), retry, { label: "getTokenSupply(mem)" }),
+      withRpcRetry(() => conn.getTokenSupply(targets.lpMint), retry, { label: "getTokenSupply(lp)" }),
+    ]);
+    return {
+      wsolAmount: wsolBal.value.amount,
+      memecoinAmount: memecoinBal.value.amount,
+      memecoinDecimals: memecoinSupply.value.decimals,
+      lpSupplyAmount: lpSupply.value.amount,
+    };
+  }
+
+  const requests: BatchRequest[] = [
+    { method: "getTokenAccountBalance", params: [targets.wsolVault.toBase58()] },
+    { method: "getTokenAccountBalance", params: [targets.memecoinVault.toBase58()] },
+    { method: "getTokenSupply", params: [targets.memecoinMint.toBase58()] },
+    { method: "getTokenSupply", params: [targets.lpMint.toBase58()] },
+  ];
+  const results = await rpcBatch(batch.rpcUrl, requests, {
+    ...(batch.fetchImpl !== undefined ? { fetchImpl: batch.fetchImpl } : {}),
+    retry,
+    governor,
+    label: "pool-token-facts",
+  });
+  // Fail closed per pool: any unresolved item aborts this pool's facts
+  // with the EXPLICIT reason (downstream records it as an enrich-stage
+  // failure). A missing response is never a negative fact.
+  for (let i = 0; i < results.length; i++) {
+    const item = results[i];
+    if (item && !item.ok) throw new Error(`pool facts unresolved: ${item.reason}`);
+  }
+  const wsol = parseTokenAmount(results[0]?.ok ? results[0].result : undefined, "wsol vault balance");
+  const memecoin = parseTokenAmount(results[1]?.ok ? results[1].result : undefined, "memecoin vault balance");
+  const memecoinSupply = parseTokenAmount(results[2]?.ok ? results[2].result : undefined, "memecoin mint supply");
+  const lpSupply = parseTokenAmount(results[3]?.ok ? results[3].result : undefined, "lp mint supply");
+  return {
+    wsolAmount: wsol.amount,
+    memecoinAmount: memecoin.amount,
+    memecoinDecimals: memecoinSupply.decimals,
+    lpSupplyAmount: lpSupply.amount,
+  };
+}
+
 /**
  * `console-snapshot` — produce the typed, secret-free console artifact
  * (P3-A Task 3.1). Real mainnet Raydium V4 facts + deployed-ProtocolConfig
@@ -490,8 +588,17 @@ export async function cmdConsoleSnapshot(
     verificationConnection?: Connection | undefined;
     discoveryFetchImpl?: typeof fetch | undefined;
     activityIndexer?: ActivityIndexerLive | undefined;
+    /** Injectable transport for the opt-in validated batch path
+     *  (tests only; production uses real fetch). */
+    batchFetchImpl?: typeof fetch | undefined;
   },
 ): Promise<number> {
+  const govCfg = loadRpcGovernanceConfig();
+  const retry = retryPolicyFromConfig(govCfg);
+  const governor = getSharedGovernor(
+    config.discoveryRpcUrl,
+    govCfg.rateLimitPerSecond > 0 ? { requestsPerSecond: govCfg.rateLimitPerSecond } : undefined,
+  );
   const conn = opts.discoveryConnection ?? new Connection(config.discoveryRpcUrl, "confirmed");
   const health = new HealthRegistry();
   const failures: ConsoleSnapshotFailure[] = [];
@@ -528,14 +635,123 @@ export async function cmdConsoleSnapshot(
   // orientation change), and the local D-01 gate below remains
   // authoritative over the parsed records (defense in depth, fail-closed).
   const t0 = Date.now();
-  const run = await discoverRaydiumV4Pools(conn, {
-    cluster: config.discoveryCluster,
-    rpcUrl: config.discoveryRpcUrl,
-    maxPools: opts.maxPools,
-    mode: "identity-slice",
-    rpcFilters: buildM1WsolQuoteSideRpcFilter(),
-    ...(opts.discoveryFetchImpl !== undefined ? { fetchImpl: opts.discoveryFetchImpl } : {}),
-  });
+  const m1RpcFilters = buildM1WsolQuoteSideRpcFilter();
+  let run: Awaited<ReturnType<typeof discoverRaydiumV4Pools>>;
+  const paginationFailures: ConsoleSnapshotFailure[] = [];
+  if (govCfg.discoveryPagination === "off") {
+    // Classic path (previous behavior), now under the bounded retry
+    // policy + shared rate governor.
+    run = await discoverRaydiumV4Pools(conn, {
+      cluster: config.discoveryCluster,
+      rpcUrl: config.discoveryRpcUrl,
+      maxPools: opts.maxPools,
+      mode: "identity-slice",
+      rpcFilters: m1RpcFilters,
+      retry,
+      governor,
+      ...(opts.discoveryFetchImpl !== undefined ? { fetchImpl: opts.discoveryFetchImpl } : {}),
+    });
+  } else {
+    // Paginated discovery (Option 2 Phase 3) behind the EXPLICIT
+    // capability gate. Verified probe evidence: both public endpoints
+    // answer -32601 (method not found) — the gate stays closed there.
+    const probe = await probeGetProgramAccountsV2(config.discoveryRpcUrl, RAYDIUM_V4_PROGRAM_ID, {
+      ...(opts.discoveryFetchImpl !== undefined ? { fetchImpl: opts.discoveryFetchImpl } : {}),
+      governor,
+    });
+    if (probe.supported) {
+      const paged = await discoverRaydiumV4PoolsPaginated(conn, {
+        cluster: config.discoveryCluster,
+        rpcUrl: config.discoveryRpcUrl,
+        provider: makeHeliusGpaV2Provider({
+          rpcUrl: config.discoveryRpcUrl,
+          programId: RAYDIUM_V4_PROGRAM_ID,
+          filters: [{ dataSize: RAYDIUM_V4_AMM_INFO_SIZE }, ...m1RpcFilters],
+          dataSlice: DISCOVERY_SLICE,
+        }),
+        maxPages: govCfg.discoveryMaxPages,
+        maxPools: opts.maxPools,
+        mode: "identity-slice",
+        ...(opts.discoveryFetchImpl !== undefined ? { fetchImpl: opts.discoveryFetchImpl } : {}),
+        retry,
+        governor,
+      });
+      run = { records: paged.records, stats: paged.stats };
+      console.log(
+        `discovery: paginated via ${paged.stats.observation.providerIdentity}, ` +
+          `pages ${paged.stats.pagesReceived}/${paged.stats.pagesRequested}, raw accounts ${paged.stats.rawAccounts}, ` +
+          `cross-page duplicates ${paged.stats.crossPageDuplicates}, ` +
+          `completeness: ${paged.completeness.kind === "complete" ? "complete" : `INCOMPLETE (${paged.completeness.reason})`}`,
+      );
+      if (paged.completeness.kind === "incomplete") {
+        paginationFailures.push({
+          stage: "discovery-completeness",
+          reason: `paginated discovery incomplete (${paged.completeness.reason}): ${paged.completeness.detail} — this artifact must NOT be treated as a complete production snapshot`,
+        });
+      }
+    } else if (govCfg.discoveryPagination === "require") {
+      console.error(
+        `console-snapshot: DISCOVERY_PAGINATION=require but the provider capability probe FAILED — ` +
+          `${probe.evidence}. Refusing to enumerate via classic getProgramAccounts and refusing to produce an artifact.`,
+      );
+      return 1;
+    } else if (govCfg.discoveryClassicFallback === "bounded") {
+      // EXPLICIT, operator-configured bounded classic fallback (never a
+      // silent one). Its completeness is CAPPED: even a fully-iterated
+      // classic response cannot rule out provider-side response limits
+      // at corpus scale, so above the account bound the run fails
+      // closed.
+      run = await discoverRaydiumV4Pools(conn, {
+        cluster: config.discoveryCluster,
+        rpcUrl: config.discoveryRpcUrl,
+        maxPools: opts.maxPools,
+        mode: "identity-slice",
+        rpcFilters: m1RpcFilters,
+        retry,
+        governor,
+        ...(opts.discoveryFetchImpl !== undefined ? { fetchImpl: opts.discoveryFetchImpl } : {}),
+      });
+      console.log(
+        `discovery: capability probe FAILED (${probe.evidence}) — EXPLICIT bounded classic fallback used; ` +
+          `${run.stats.rawAccounts} raw accounts`,
+      );
+      if (run.stats.truncated || run.stats.rawAccounts > govCfg.classicFallbackCompleteMaxAccounts) {
+        paginationFailures.push({
+          stage: "discovery-completeness",
+          reason:
+            `bounded classic fallback cannot prove complete enumeration: ` +
+            `${run.stats.rawAccounts} raw account(s) returned (completeness bound ${govCfg.classicFallbackCompleteMaxAccounts}), ` +
+            `truncated=${String(run.stats.truncated)} — this artifact must NOT be treated as a complete production snapshot ` +
+            `(the provider pagination contract must be verified before corpus-scale completeness is claimable)`,
+        });
+      }
+    } else {
+      // Fail closed: no fallback configured, capability unavailable.
+      console.error(
+        `console-snapshot: DISCOVERY_PAGINATION=probe but the capability probe FAILED — ${probe.evidence}; ` +
+          `no fallback configured (DISCOVERY_CLASSIC_FALLBACK=none) — failing closed`,
+      );
+      run = {
+        records: [],
+        stats: {
+          rawAccounts: 0,
+          parsedPools: 0,
+          malformedSkipped: 0,
+          unsupportedPairs: 0,
+          duplicatesInBatch: 0,
+          slotLowerBound: 0,
+          slotUpperBound: 0,
+          durationMs: 0,
+          iteratedAccounts: 0,
+          truncated: true,
+        },
+      };
+      paginationFailures.push({
+        stage: "discovery-completeness",
+        reason: `paginated discovery capability unavailable and no fallback configured: ${probe.evidence} — failing closed`,
+      });
+    }
+  }
   health.recordSuccess("rpc-discovery", Date.now() - t0);
   const wsolSupported = run.records
     .filter((r) => r.wsolSide !== null)
@@ -596,6 +812,21 @@ export async function cmdConsoleSnapshot(
     failures.push({ stage: "discovery-completeness", reason });
     console.error(`console-snapshot: COMPLETENESS — ${reason}`);
   }
+  // Paginated-discovery completeness failures (Option 2 Phase 3): the
+  // capability gate, page budget, fallback bound and provider-contract
+  // status all flow into the SAME machine-checkable completeness stage,
+  // so an incomplete paginated run can never pass as publication-ready.
+  for (const pf of paginationFailures) {
+    failures.push(pf);
+    console.error(`console-snapshot: COMPLETENESS — ${pf.reason}`);
+  }
+  // Bounded-observation provenance (Option 2, slot-consistency
+  // correction): surface the observation window in the operator log.
+  // The artifact schema is unchanged — this is observability, not a
+  // schema change, and NO point-in-time snapshot is claimed anywhere.
+  if (run.stats.observation) {
+    console.log(`discovery: ${run.stats.observation.boundedWindowDescription}`);
+  }
   const enrichmentCapped = supported.length > targets.length;
   if (enrichmentCapped) {
     const reason =
@@ -616,73 +847,155 @@ export async function cmdConsoleSnapshot(
       rpcUrl: config.discoveryRpcUrl,
     });
   const enrichments = new Map<string, PoolEnrichment>();
-  for (const record of targets) {
-    const address = record.poolAddress.toBase58();
-    const fetchedAt = Date.now();
-    try {
-      const wsolVault = record.wsolSide!.coinIsWsol ? record.pool.coinVault : record.pool.pcVault;
-      const memecoinVault = record.wsolSide!.coinIsWsol ? record.pool.pcVault : record.pool.coinVault;
-      const memecoinMint = record.wsolSide!.memecoinMint;
-      const [wsolBal, memecoinBal, memecoinSupply, lpSupply, activity] = await Promise.all([
-        conn.getTokenAccountBalance(wsolVault),
-        conn.getTokenAccountBalance(memecoinVault),
-        conn.getTokenSupply(memecoinMint),
-        conn.getTokenSupply(record.pool.lpMint),
-        activityIndexer
-          .indexActivity(conn, record.poolAddress, { scanLimit: config.signatureScanLimit })
-          .catch((err) => {
-            failures.push({ stage: "activity", pool: address, reason: String((err as Error).message ?? err).slice(0, 120) });
-            return null;
-          }),
-      ]);
-      // Shared evidence gate (IMPL-001): the SAME `evaluateAttestationGate`
-      // the collect/attestation path applies decides whether a derivation
-      // may seed the C1 last-swap anchor. Only VERIFIED, DEFINITIVE,
-      // well-formed, FRESH evidence passes; incomplete, non-verified
-      // (e.g. a definitive no-swap scan), mislabeled, malformed, missing
-      // and stale records are excluded — the pool stays without a
-      // lastSwap anchor and C1 renders "pending" instead of evaluating on
-      // weak evidence. In particular, stale verified evidence (older than
-      // the shared freshness bound) can no longer enter C1 — the previous
-      // manual condition checked status/definitive/timestamp but had NO
-      // freshness check at all.
-      const gate = evaluateAttestationGate(activity, {
-        maxAgeMs: EVIDENCE_FRESHNESS_MAX_AGE_MS,
-      });
-      const lastSwap = gate.ok
-        ? {
-            unixTs: gate.activity.lastSwapUnixTs,
-            slot: gate.activity.lastSwapSlot,
-            signature: gate.activity.lastSwapSignature,
-          }
-        : null;
-      if (activity !== null && !gate.ok && gate.reason !== "not_verified") {
-        // Observability (Correction 002 §1.5): record WHY no anchor was
-        // established. A definitive no_swap_in_scan is an honest, complete
-        // determination that simply carries no swap anchor — not a
-        // pipeline failure — so it is excluded without a failure record
-        // (reason "not_verified"). Every other rejection is anomalous and
-        // recorded: incomplete (C1 not evaluable from this derivation),
-        // stale, malformed/mislabeled, non-definitive. Missing evidence
-        // (activity === null) was already recorded by the catch above.
-        failures.push({
-          stage: "activity",
-          pool: address,
-          reason: `evidence gate rejected the derivation (${gate.reason}) — ${gate.detail}`,
+  // Bounded concurrency (Option 2 Phase 1, item C): workers run under
+  // `ENRICHMENT_CONCURRENCY` (default 4) and share the process-wide
+  // rate governor, so the pool set can no longer serialize on one pool
+  // at a time — while per-pool accounting stays EXACTLY per-pool and
+  // the post-pass below restores full determinism (results are consumed
+  // in INPUT order regardless of completion order).
+  interface PerPoolOutcome {
+    address: string;
+    enrichment?: PoolEnrichment;
+    activityFailure?: ConsoleSnapshotFailure;
+    gateFailure?: ConsoleSnapshotFailure;
+    enrichError?: unknown;
+  }
+  const outcomes = await mapWithConcurrency(
+    targets,
+    govCfg.enrichmentConcurrency,
+    async (record): Promise<PerPoolOutcome> => {
+      const address = record.poolAddress.toBase58();
+      const fetchedAt = Date.now();
+      // Activity runs concurrently with the token facts (as before).
+      // A derivation failure is a PER-POOL activity failure — recorded,
+      // never swallowed, never converted into evidence.
+      const activityAttempt = await activityIndexer
+        .indexActivity(conn, record.poolAddress, {
+          scanLimit: config.signatureScanLimit,
+          // Vault passthrough (Option 2 Phase 1, item A): the discovery
+          // record's parsed AmmInfo identity IS the authoritative vault
+          // pair — passing it eliminates the redundant on-chain pool
+          // fetch inside every derivation. The SDK's identity/ownership
+          // validation and fail-closed rules are unchanged.
+          coinVault: record.pool.coinVault,
+          pcVault: record.pool.pcVault,
+        })
+        .then(
+          (a) => ({ a }),
+          (err) => ({ err }),
+        );
+      const activityFailure: ConsoleSnapshotFailure | undefined =
+        "err" in activityAttempt
+          ? {
+              stage: "activity",
+              pool: address,
+              reason: String(
+                (activityAttempt.err as Error).message ?? activityAttempt.err,
+              ).slice(0, 120),
+            }
+          : undefined;
+      try {
+        const wsolVault = record.wsolSide!.coinIsWsol ? record.pool.coinVault : record.pool.pcVault;
+        const memecoinVault = record.wsolSide!.coinIsWsol ? record.pool.pcVault : record.pool.coinVault;
+        const memecoinMint = record.wsolSide!.memecoinMint;
+        const facts = await fetchPoolTokenFacts(retry, governor, conn, {
+          enabled: govCfg.enrichmentBatchEnabled,
+          rpcUrl: config.discoveryRpcUrl,
+          fetchImpl: opts.batchFetchImpl,
+        }, {
+          wsolVault,
+          memecoinVault,
+          memecoinMint,
+          lpMint: record.pool.lpMint,
         });
+        const activity = "a" in activityAttempt ? activityAttempt.a : null;
+        // Shared evidence gate (IMPL-001): the SAME `evaluateAttestationGate`
+        // the collect/attestation path applies decides whether a derivation
+        // may seed the C1 last-swap anchor. Only VERIFIED, DEFINITIVE,
+        // well-formed, FRESH evidence passes; incomplete, non-verified
+        // (e.g. a definitive no-swap scan), mislabeled, malformed, missing
+        // and stale records are excluded — the pool stays without a
+        // lastSwap anchor and C1 renders "pending" instead of evaluating on
+        // weak evidence. In particular, stale verified evidence (older than
+        // the shared freshness bound) can no longer enter C1 — the previous
+        // manual condition checked status/definitive/timestamp but had NO
+        // freshness check at all.
+        const gate = evaluateAttestationGate(activity, {
+          maxAgeMs: EVIDENCE_FRESHNESS_MAX_AGE_MS,
+        });
+        const lastSwap = gate.ok
+          ? {
+              unixTs: gate.activity.lastSwapUnixTs,
+              slot: gate.activity.lastSwapSlot,
+              signature: gate.activity.lastSwapSignature,
+            }
+          : null;
+        let gateFailure: ConsoleSnapshotFailure | undefined;
+        if (activity !== null && !gate.ok && gate.reason !== "not_verified") {
+          // Observability (Correction 002 §1.5): record WHY no anchor was
+          // established. A definitive no_swap_in_scan is an honest, complete
+          // determination that simply carries no swap anchor — not a
+          // pipeline failure — so it is excluded without a failure record
+          // (reason "not_verified"). Every other rejection is anomalous and
+          // recorded: incomplete (C1 not evaluable from this derivation),
+          // stale, malformed/mislabeled, non-definitive. Missing evidence
+          // was already recorded by the activity catch above.
+          gateFailure = {
+            stage: "activity",
+            pool: address,
+            reason: `evidence gate rejected the derivation (${gate.reason}) — ${gate.detail}`,
+          };
+        }
+        return {
+          address,
+          enrichment: {
+            wsolReserveLamports: facts.wsolAmount,
+            memecoinReserveRaw: facts.memecoinAmount,
+            memecoinDecimals: facts.memecoinDecimals,
+            lpSupplyRaw: facts.lpSupplyAmount,
+            lastSwap,
+            fetchedAtUnixMs: fetchedAt,
+          },
+          ...(activityFailure !== undefined ? { activityFailure } : {}),
+          ...(gateFailure !== undefined ? { gateFailure } : {}),
+        };
+      } catch (err) {
+        return {
+          address,
+          ...(activityFailure !== undefined ? { activityFailure } : {}),
+          enrichError: err,
+        };
       }
-      enrichments.set(address, {
-        wsolReserveLamports: wsolBal.value.amount,
-        memecoinReserveRaw: memecoinBal.value.amount,
-        memecoinDecimals: memecoinSupply.value.decimals,
-        lpSupplyRaw: lpSupply.value.amount,
-        lastSwap,
-        fetchedAtUnixMs: fetchedAt,
+    },
+  );
+  // Deterministic post-pass in INPUT order: failure records, health
+  // accounting and the enrichment map are populated exactly as the
+  // previous sequential loop did, preserving artifact byte-stability
+  // for identical observed inputs. (Workers handle their own errors;
+  // a settled-rejected slot — which the worker contract makes
+  // unreachable in practice — degrades to an explicit enrich failure
+  // rather than being dropped.)
+  for (const settled of outcomes) {
+    const outcome: PerPoolOutcome =
+      settled.ok
+        ? settled.value
+        : { address: "unknown", enrichError: settled.error };
+    if (outcome.activityFailure !== undefined) {
+      failures.push(outcome.activityFailure);
+    }
+    if (outcome.gateFailure !== undefined) {
+      failures.push(outcome.gateFailure);
+    }
+    if (outcome.enrichError !== undefined) {
+      failures.push({
+        stage: "enrich",
+        pool: outcome.address,
+        reason: String((outcome.enrichError as Error).message ?? outcome.enrichError).slice(0, 120),
       });
+      health.recordFailure("enrich", outcome.enrichError);
+    } else if (outcome.enrichment !== undefined) {
+      enrichments.set(outcome.address, outcome.enrichment);
       health.recordSuccess("enrich", 0);
-    } catch (err) {
-      failures.push({ stage: "enrich", pool: address, reason: String((err as Error).message ?? err).slice(0, 120) });
-      health.recordFailure("enrich", err);
     }
   }
 

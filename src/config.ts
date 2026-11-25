@@ -61,6 +61,98 @@ export const DEFAULT_DISCOVERY_STALENESS_SLOTS = 400;
  *  than this (it could never be accepted on chain). Default 450 < 512. */
 export const DEFAULT_EVIDENCE_FRESHNESS_SLOTS = 450;
 
+// ─── Option 2 governance configuration (Phase 1/3) ──────────────────────────
+//
+// Every knob is env-driven with a default that PRESERVES the previous
+// pipeline behavior. The new capabilities (retry transport, bounded
+// enrichment concurrency, validated RPC batching, paginated discovery)
+// activate only when the operator opts in — except the bounded retry
+// policy and enrichment concurrency, which ship with conservative
+// defaults that keep artifacts byte-stable for identical inputs.
+
+/** Retry/governance/batching/pagination configuration. */
+export interface RpcGovernanceConfig {
+  /** Bounded retry policy applied to pipeline RPC operations. */
+  rpcRetry: {
+    maxRetries: number;
+    baseDelayMs: number;
+    maxDelayMs: number;
+    /** Overall wall-clock deadline per operation (ms). */
+    overallDeadlineMs: number;
+  };
+  /** Enrichment worker concurrency (per-pool parallelism). The input
+   *  order is preserved by the concurrency primitive, so artifacts stay
+   *  deterministic. Default 4 (was: sequential). */
+  enrichmentConcurrency: number;
+  /** Explicit rate budget for the shared governor (requests/second).
+   *  0 (default) = provider-aware defaults (public endpoints: 4 rps). */
+  rateLimitPerSecond: number;
+  /** Validated JSON-RPC batching for enrichment facts (default OFF —
+   *  per-call web3.js path preserved until the owner opts in). */
+  enrichmentBatchEnabled: boolean;
+  /** Paginated discovery mode (default OFF = exact classic behavior):
+   *  "off"    — classic unpaginated getProgramAccounts (current path);
+   *  "probe"  — probe getProgramAccountsV2; if unsupported, fail closed
+   *             with an explicit discovery-completeness failure (and,
+   *             only when discoveryClassicFallback is "bounded", run the
+   *             capped classic fallback which CANNOT report completeness
+   *             above the classic-fallback account bound);
+   *  "require" — paginated enumeration required; capability failure is
+   *             a hard error. */
+  discoveryPagination: "off" | "probe" | "require";
+  /** Page budget for paginated discovery (exhaustion → incomplete). */
+  discoveryMaxPages: number;
+  /** Explicit bounded classic fallback when the capability gate is
+   *  closed ("none" = fail closed, no fallback). */
+  discoveryClassicFallback: "none" | "bounded";
+  /** A bounded classic-fallback run may only be treated as complete
+   *  when the corpus is smaller than this (a fully-iterated classic
+   *  response at corpus scale cannot rule out provider-side response
+   *  limits — fail closed above this bound). */
+  classicFallbackCompleteMaxAccounts: number;
+}
+
+/** Load the Option 2 governance configuration from env. */
+export function loadRpcGovernanceConfig(): RpcGovernanceConfig {
+  const paginationEnv = (process.env.DISCOVERY_PAGINATION ?? "off").toLowerCase();
+  const discoveryPagination =
+    paginationEnv === "probe" ? "probe" : paginationEnv === "require" ? "require" : "off";
+  const fallbackEnv = (process.env.DISCOVERY_CLASSIC_FALLBACK ?? "none").toLowerCase();
+  const discoveryClassicFallback = fallbackEnv === "bounded" ? "bounded" : "none";
+  return {
+    rpcRetry: {
+      maxRetries: intEnv("RPC_MAX_RETRIES", 3),
+      baseDelayMs: intEnv("RPC_BASE_DELAY_MS", 250),
+      maxDelayMs: intEnv("RPC_MAX_DELAY_MS", 8_000),
+      overallDeadlineMs: intEnv("RPC_DEADLINE_MS", 45_000),
+    },
+    enrichmentConcurrency: intEnv("ENRICHMENT_CONCURRENCY", 4),
+    rateLimitPerSecond: intEnv("RPC_RATE_LIMIT_PER_SEC", 0),
+    enrichmentBatchEnabled: (process.env.RPC_BATCH_ENABLED ?? "false") === "true",
+    discoveryPagination,
+    discoveryMaxPages: intEnv("DISCOVERY_MAX_PAGES", 100),
+    discoveryClassicFallback,
+    classicFallbackCompleteMaxAccounts: intEnv("CLASSIC_FALLBACK_COMPLETE_MAX_ACCOUNTS", 10_000),
+  };
+}
+
+/** Build the bounded retry policy object from the governance config. */
+export function retryPolicyFromConfig(cfg: RpcGovernanceConfig): {
+  maxRetries: number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+  jitterRatio: number;
+  overallDeadlineMs: number;
+} {
+  return {
+    maxRetries: cfg.rpcRetry.maxRetries,
+    baseDelayMs: cfg.rpcRetry.baseDelayMs,
+    maxDelayMs: cfg.rpcRetry.maxDelayMs,
+    jitterRatio: 0.25,
+    overallDeadlineMs: cfg.rpcRetry.overallDeadlineMs,
+  };
+}
+
 /** Pipeline configuration, loaded from env with safe defaults. */
 export interface PipelineConfig {
   /** Discovery RPC endpoint (read-only usage enforced by convention). */
